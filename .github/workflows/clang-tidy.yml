@@ -1,0 +1,90 @@
+# Lint on push to main and PRs. Findings show up as GitHub workflow
+# annotations on the PR Files tab.
+
+name: clang-tidy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tests/**'
+      - '.clang-tidy'
+      - 'CMakeLists.txt'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'include/**'
+      - 'tests/**'
+      - '.clang-tidy'
+      - 'CMakeLists.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clang-tidy:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang-tidy \
+            libsqlite3-dev
+
+      - name: Configure
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+
+      - name: Run clang-tidy
+        run: |
+          mapfile -t files < <(
+            find src include -type f \
+              \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
+              2>/dev/null
+          )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no source files to lint"
+            exit 0
+          fi
+          echo "::group::clang-tidy: linting ${#files[@]} files"
+          clang-tidy -p build -quiet "${files[@]}" 2>&1 | tee tidy.log
+          echo "::endgroup::"
+
+          awk -F: '
+            /: (warning|error): / {
+              file = $1; line = $2; col = $3;
+              severity = ($4 ~ /error/) ? "error" : "warning";
+              msg = $0;
+              sub(/^[^:]+:[^:]+:[^:]+:[[:space:]]*(warning|error):[[:space:]]*/, "", msg);
+              printf "::%s file=%s,line=%s,col=%s::%s\n",
+                     severity, file, line, col, msg;
+            }
+          ' tidy.log
+
+          # Strict on push to main. PRs surface annotations without
+          # blocking, so an incremental cleanup is possible.
+          if [ "${{ github.event_name }}" = "push" ]; then
+            if grep -qE ': (warning|error): ' tidy.log; then
+              echo "::error::clang-tidy reported findings on push-to-main"
+              exit 1
+            fi
+          fi
+
+      - name: Upload tidy log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clang-tidy-log
+          path: tidy.log
+          retention-days: 14
